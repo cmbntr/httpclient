@@ -50,6 +50,9 @@ import javax.net.ssl.X509TrustManager;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.IOException;
+import java.lang.ref.WeakReference;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.Socket;
@@ -63,6 +66,7 @@ import java.security.NoSuchProviderException;
 import java.security.SecureRandom;
 import java.security.UnrecoverableKeyException;
 import java.security.cert.CertificateException;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Layered socket factory for TLS/SSL connections.
@@ -569,6 +573,7 @@ public class SSLSocketFactory implements SchemeLayeredSocketFactory,
         }
         if (this.hostnameVerifier != null) {
             try {
+                HostNameSetter.setServerNameIndication(hostname, sslsock);
                 this.hostnameVerifier.verify(hostname, sslsock);
                 // verifyHostName() didn't blowup - good!
             } catch (IOException iox) {
@@ -578,6 +583,83 @@ public class SSLSocketFactory implements SchemeLayeredSocketFactory,
             }
         }
         return sslsock;
+    }
+
+    /**
+     * Uses the underlying implementation to support Server Name Indication (SNI).
+     * @author Michael Locher <cmbntr@gmail.com>
+     */
+    private static class HostNameSetter {
+
+        private static final AtomicReference<HostNameSetter> CURRENT = new AtomicReference<HostNameSetter>();
+
+        private final WeakReference<Class<?>> cls;
+        private final WeakReference<Method> setter;
+
+        private HostNameSetter(Class<?> clazz, Method setter) {
+            this.cls = new WeakReference<Class<?>>(clazz);
+            this.setter = setter == null ? null : new WeakReference<Method>(setter);
+        }
+
+        private static Method init(Class<?> cls) {
+            Method s = null;
+            try {
+                s = cls.getMethod("setHost", String.class);
+            } catch (SecurityException e) {
+                initFail(e);
+            } catch (NoSuchMethodException e) {
+                initFail(e);
+            }
+            CURRENT.set(new HostNameSetter(cls, s));
+            return s;
+        }
+
+        private static void initFail(Exception e) {
+            // ignore
+        }
+
+        private Method reuse(Class<?> cls) {
+            final boolean wrongClass = this.cls.get() != cls;
+            if (wrongClass) {
+                return init(cls);
+            }
+
+            final boolean setterNotSupported = this.setter == null;
+            if (setterNotSupported) {
+                return null;
+            }
+
+            final Method s = setter.get();
+            final boolean setterLost = s == null;
+            return setterLost ? init(cls) : s;
+        }
+
+        /**
+         * Invokes the {@code #setName(String)} method if one is present.
+         *
+         * @param hostname the name to set
+         * @param sslsock the socket
+         */
+        public static void setServerNameIndication(String hostname, SSLSocket sslsock) {
+            final Class<?> cls = sslsock.getClass();
+            final HostNameSetter current = CURRENT.get();
+            final Method setter = (current == null) ? init(cls) : current.reuse(cls);
+            if (setter != null) {
+                try {
+                    setter.invoke(sslsock, hostname);
+                } catch (IllegalArgumentException e) {
+                    setServerNameIndicationFail(e);
+                } catch (IllegalAccessException e) {
+                    setServerNameIndicationFail(e);
+                } catch (InvocationTargetException e) {
+                    setServerNameIndicationFail(e);
+                }
+            }
+        }
+
+        private static void setServerNameIndicationFail(Exception e) {
+            // ignore
+        }
     }
 
 
